@@ -1,4 +1,17 @@
-"""Локальный калькулятор стоимости клининга. Работает без интернета."""
+"""Локальный калькулятор стоимости клининга.
+
+Что делает программа:
+1. Читает прайс из Excel.
+2. По площади, типу уборки и отмеченным допам считает четыре суммы:
+   база, накладные, прибыль и цену для клиента.
+3. Показывает их в стеклянном окне и не ходит в интернет во время расчёта.
+
+Откуда берётся Excel:
+- «По ссылке» — файл calculator_data.xlsx рядом с программой.
+  Это сохранённая копия публичного файла
+  https://disk.yandex.ru/d/CvsQ3e9jhpVWJQ
+- «С компьютера» — любой другой xlsx, который выбирает пользователь.
+"""
 
 from __future__ import annotations
 
@@ -9,12 +22,10 @@ import tkinter as tk
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from tkinter import font as tkfont
-from tkinter import messagebox
+from tkinter import filedialog, font as tkfont, messagebox
 
 import customtkinter as ctk
 from openpyxl import load_workbook
-from openpyxl.utils.exceptions import InvalidFileException
 from PIL import Image, ImageDraw, ImageFilter
 
 NAVY = "#0f172a"
@@ -38,6 +49,7 @@ SHIMMER = (
     (15, 118, 110),
 )
 
+# Износ инвентаря: 1% от суммы цен позиций в штуках и часах.
 WEAR = 0.01
 PERCENT_KEYS = (
     "Налог_Процент",
@@ -104,12 +116,14 @@ class Result:
 
 
 def app_dir() -> Path:
+    """Папка программы: рядом с exe, если собрано в один файл, иначе рядом со скриптом."""
     if getattr(sys, "frozen", False):
         return Path(sys.executable).resolve().parent
     return Path(__file__).resolve().parent
 
 
 def data_file() -> Path:
+    """Файл по умолчанию: копия таблицы с Яндекс.Диска в папке программы."""
     return app_dir() / "calculator_data.xlsx"
 
 
@@ -193,37 +207,34 @@ def cell(row: tuple, headers: dict[str, int], name: str):
     return row[index]
 
 
-def _friendly_io_error(exc: Exception) -> DataError:
+def _friendly_io_error(exc: Exception, source: Path) -> DataError:
+    """Переводим системную ошибку чтения в понятный текст."""
     text = str(exc).lower()
     winerror = getattr(exc, "winerror", None)
+    name = source.name
     if isinstance(exc, PermissionError) or winerror in {32, 33} or "permission" in text or "занят" in text:
         return DataError(
-            "Файл calculator_data.xlsx открыт в Excel или занят другой программой. "
+            f"Файл {name} открыт в Excel или занят другой программой. "
             "Закройте его и нажмите «Обновить данные»."
         )
     if isinstance(exc, FileNotFoundError):
-        return DataError(
-            "Не найден файл calculator_data.xlsx. Положите его в ту же папку, что и программа."
-        )
-    if isinstance(exc, (InvalidFileException, OSError)):
-        return DataError(f"Не удалось прочитать calculator_data.xlsx. {exc}")
-    return DataError(f"Не удалось прочитать calculator_data.xlsx. {exc}")
+        return DataError(f"Не найден файл {name}. Выберите другой файл или вернитесь к файлу по ссылке.")
+    return DataError(f"Не удалось прочитать {name}. {exc}")
 
 
 def load_catalog(path: Path | None = None) -> Catalog:
+    """Читаем три листа и проверяем, что в файле есть всё для формулы."""
     source = path or data_file()
     if not source.exists():
-        raise DataError(
-            "Не найден файл calculator_data.xlsx. Положите его в ту же папку, что и программа."
-        )
+        raise DataError(f"Не найден файл {source.name}. Положите его в папку программы или выберите другой.")
     try:
         workbook = load_workbook(source, data_only=True, read_only=True)
     except Exception as exc:
-        raise _friendly_io_error(exc) from exc
+        raise _friendly_io_error(exc, source) from exc
     try:
         materials = _read_materials(find_sheet(workbook, "Materials"))
         services = _read_services(find_sheet(workbook, "Services"))
-        constants = _read_constants(find_sheet(workbook, "Лист3"))
+        constants = _read_constants(find_sheet(workbook, "Constants"))
     finally:
         workbook.close()
     if not materials:
@@ -233,7 +244,7 @@ def load_catalog(path: Path | None = None) -> Catalog:
     by_key = {item.key: item for item in constants}
     missing = [key for key in ("Транспорт_Центр", "Транспорт_Область", *PERCENT_KEYS) if key not in by_key]
     if missing:
-        raise DataError("На листе «Лист3» нет ключей: " + ", ".join(missing))
+        raise DataError("На листе констант нет ключей: " + ", ".join(missing))
     return Catalog(materials, services, constants, by_key, datetime.now())
 
 
@@ -324,10 +335,12 @@ def _read_constants(sheet) -> list[Constant]:
     return constants
 
 
+# Эти две константы не начинаются с «Цена_», но тоже идут отдельными галочками.
 OPTIONAL_EXTRA_KEYS = ("Срочный_выезд", "Аренда_инвентаря")
 
 
 def extra_services(catalog: Catalog) -> list[Constant]:
+    """Допы для галочек: все ключи Цена_ плюс срочный выезд и аренда инвентаря."""
     return [
         item
         for item in catalog.constants
@@ -344,6 +357,13 @@ def calculate(
     holiday: bool,
     location: str,
 ) -> Result:
+    """Считаем цену строго в четыре шага: база, издержки, наценка, итог.
+
+    База = материалы по площади + работа (не меньше минимума часов) + выбранные допы.
+    Издержки = транспорт + 1% амортизации + налог от базы.
+    Наценка = маржа от базы и, если отмечены, надбавки за выходной и праздник.
+    Цена для клиента = база + издержки + наценка.
+    """
     if area <= 0:
         raise DataError("Площадь должна быть больше нуля")
     service = next((item for item in catalog.services if item.type_name == service_name), None)
@@ -402,6 +422,7 @@ def calculate(
 
 
 def render_icon(size: int = 512) -> Image.Image:
+    """Рисуем иконку запуска: скруглённый квадрат, мятно-бирюзовый градиент и белая звезда."""
     mask = Image.new("L", (size, size), 0)
     ImageDraw.Draw(mask).rounded_rectangle((8, 8, size - 9, size - 9), radius=int(size * 0.24), fill=255)
     horizontal = Image.linear_gradient("L").resize((size, size))
@@ -446,6 +467,7 @@ def ensure_brand_icons(folder: Path) -> Path:
 
 
 def shimmer_color(phase: float) -> str:
+    """Цвет рамки карточек плавно проходит по мятно-бирюзовой палитре."""
     spot = ((math.sin(phase) + 1) / 2) * (len(SHIMMER) - 1)
     left = int(spot)
     right = min(left + 1, len(SHIMMER) - 1)
@@ -455,6 +477,7 @@ def shimmer_color(phase: float) -> str:
 
 
 def render_background_layers(width: int, height: int) -> tuple[Image.Image, Image.Image]:
+    """Фон окна: тёмный градиент и размытые пятна. Настоящее стекло в этом интерфейсе недоступно."""
     width = max(width, 200)
     height = max(height, 200)
     top = Image.new("RGBA", (width, height), (15, 23, 42, 255))
@@ -478,6 +501,7 @@ def render_background_layers(width: int, height: int) -> tuple[Image.Image, Imag
 
 
 def compose_background(base: Image.Image, glow: Image.Image, phase: float) -> Image.Image:
+    """Сдвигаем пятна по кругу, чтобы фон мягко переливался."""
     width, height = base.size
     glow_w, glow_h = glow.size
     span_x = max(glow_w - width, 1)
@@ -503,6 +527,8 @@ class CalculatorApp(ctk.CTk):
         self.minsize(1080, 720)
         self.catalog: Catalog | None = None
         self.extra_rows: list[ExtraRow] = []
+        # None означает «файл по ссылке», путь — выбранный xlsx с компьютера.
+        self.local_path: Path | None = None
         self._bg_size = (0, 0)
         self._resize_job: str | None = None
         self._base_layer: Image.Image | None = None
@@ -519,6 +545,7 @@ class CalculatorApp(ctk.CTk):
         self.service_hint = tk.StringVar(value="")
         self.location_hint = tk.StringVar(value="")
         self.status_var = tk.StringVar(value="Загрузка данных…")
+        self.file_caption = tk.StringVar(value="")
         self.base_var = tk.StringVar(value="—")
         self.overhead_var = tk.StringVar(value="—")
         self.markup_var = tk.StringVar(value="—")
@@ -589,6 +616,7 @@ class CalculatorApp(ctk.CTk):
         self.bg_label.lower()
 
     def _shimmer(self) -> None:
+        """Каждые 120 мс обновляем цвет рамок и положение бликов."""
         if not self.winfo_exists():
             return
         self._phase = (self._phase + 0.045) % (math.tau)
@@ -665,7 +693,48 @@ class CalculatorApp(ctk.CTk):
         form.pack(fill="both", expand=True, padx=20, pady=18)
         form.grid_columnconfigure(0, weight=1)
 
-        self._field_label(form, "Площадь помещения (кв.м)", 0)
+        self._field_label(form, "Файл для расчёта", 0)
+        source_row = ctk.CTkFrame(form, fg_color="transparent")
+        source_row.grid(row=1, column=0, sticky="ew")
+        # Переключатель: таблица с Яндекс.Диска или свой файл с диска.
+        self.source_switch = ctk.CTkSegmentedButton(
+            source_row,
+            values=["По ссылке", "С компьютера"],
+            command=self._on_source_change,
+            font=self._font(13, "bold"),
+            selected_color=TEAL,
+            selected_hover_color=TEAL_DEEP,
+            unselected_color=FIELD,
+            unselected_hover_color="#134e4a",
+            text_color=TEXT,
+        )
+        self.source_switch.set("По ссылке")
+        self.source_switch.pack(side="left")
+        ctk.CTkButton(
+            source_row,
+            text="Обзор…",
+            command=self.choose_local_file,
+            width=90,
+            height=32,
+            corner_radius=16,
+            fg_color="transparent",
+            hover_color="#134e4a",
+            border_width=1,
+            border_color=MINT,
+            text_color=MINT,
+            font=self._font(13, "bold"),
+        ).pack(side="left", padx=(8, 0))
+        ctk.CTkLabel(
+            form,
+            textvariable=self.file_caption,
+            text_color=MINT_DIM,
+            font=self._font(12),
+            anchor="w",
+            wraplength=430,
+            justify="left",
+        ).grid(row=2, column=0, sticky="w", pady=(4, 0))
+
+        self._field_label(form, "Площадь помещения (кв.м)", 3)
         self.area_entry = ctk.CTkEntry(
             form,
             textvariable=self.area_var,
@@ -677,10 +746,10 @@ class CalculatorApp(ctk.CTk):
             font=self._font(16),
             placeholder_text="например, 50",
         )
-        self.area_entry.grid(row=1, column=0, sticky="ew")
+        self.area_entry.grid(row=4, column=0, sticky="ew")
         self.area_entry.bind("<Return>", lambda _event: self.calculate())
 
-        self._field_label(form, "Тип уборки", 2)
+        self._field_label(form, "Тип уборки", 5)
         self.service_box = ctk.CTkComboBox(
             form,
             variable=self.service_var,
@@ -699,12 +768,12 @@ class CalculatorApp(ctk.CTk):
             font=self._font(15),
             command=self._update_service_hint,
         )
-        self.service_box.grid(row=3, column=0, sticky="ew")
-        ctk.CTkLabel(form, textvariable=self.service_hint, text_color=MINT_DIM, font=self._font(12), anchor="w").grid(
-            row=4, column=0, sticky="w", pady=(4, 0)
+        self.service_box.grid(row=6, column=0, sticky="ew")
+        ctk.CTkLabel(form, textvariable=self.service_hint, text_color=MINT_DIM, font=self._font(12), anchor="w"        ).grid(
+            row=7, column=0, sticky="w", pady=(4, 0)
         )
 
-        self._field_label(form, "Локация", 5)
+        self._field_label(form, "Локация", 8)
         self.location_box = ctk.CTkComboBox(
             form,
             variable=self.location_var,
@@ -723,18 +792,18 @@ class CalculatorApp(ctk.CTk):
             font=self._font(15),
             command=lambda _value: self._update_location_hint(),
         )
-        self.location_box.grid(row=6, column=0, sticky="ew")
-        ctk.CTkLabel(form, textvariable=self.location_hint, text_color=MINT_DIM, font=self._font(12), anchor="w").grid(
-            row=7, column=0, sticky="w", pady=(4, 2)
+        self.location_box.grid(row=9, column=0, sticky="ew")
+        ctk.CTkLabel(form, textvariable=self.location_hint, text_color=MINT_DIM, font=self._font(12), anchor="w"        ).grid(
+            row=10, column=0, sticky="w", pady=(4, 2)
         )
 
         flags = ctk.CTkFrame(form, fg_color="transparent")
-        flags.grid(row=8, column=0, sticky="w", pady=(8, 4))
+        flags.grid(row=11, column=0, sticky="w", pady=(8, 4))
         self._check(flags, "Выходной день", self.weekend_var).pack(side="left", padx=(0, 18))
         self._check(flags, "Праздничный день", self.holiday_var).pack(side="left")
 
-        ctk.CTkLabel(form, text="Дополнительные услуги", text_color=TEXT, font=self._font(16, "bold"), anchor="w").grid(
-            row=9, column=0, sticky="w", pady=(12, 6)
+        ctk.CTkLabel(form, text="Дополнительные услуги", text_color=TEXT, font=self._font(16, "bold"), anchor="w"        ).grid(
+            row=12, column=0, sticky="w", pady=(12, 6)
         )
         self.extras = ctk.CTkScrollableFrame(
             form,
@@ -744,10 +813,10 @@ class CalculatorApp(ctk.CTk):
             border_color="#245c56",
             scrollbar_button_color=TEAL,
             scrollbar_button_hover_color=MINT,
-            height=230,
+            height=180,
         )
-        self.extras.grid(row=10, column=0, sticky="nsew")
-        form.grid_rowconfigure(10, weight=1)
+        self.extras.grid(row=13, column=0, sticky="nsew")
+        form.grid_rowconfigure(13, weight=1)
 
         self.calc_button = ctk.CTkButton(
             form,
@@ -762,9 +831,9 @@ class CalculatorApp(ctk.CTk):
             text_color="#f0fdfa",
             font=self._font(18, "bold"),
         )
-        self.calc_button.grid(row=11, column=0, sticky="ew", pady=(14, 0))
+        self.calc_button.grid(row=14, column=0, sticky="ew", pady=(14, 0))
         ctk.CTkLabel(form, textvariable=self.status_var, text_color=MUTED, font=self._font(11), anchor="w", wraplength=460).grid(
-            row=12, column=0, sticky="w", pady=(8, 0)
+            row=15, column=0, sticky="w", pady=(8, 0)
         )
 
     def _check(self, parent, text: str, variable: tk.BooleanVar) -> ctk.CTkCheckBox:
@@ -839,20 +908,59 @@ class CalculatorApp(ctk.CTk):
             value_label.pack_configure(pady=(0, 14))
         return value_label
 
+    def current_data_path(self) -> Path:
+        """Какой Excel сейчас считается источником: свой файл или файл по ссылке."""
+        if self.source_switch.get() == "С компьютера" and self.local_path is not None:
+            return self.local_path
+        return data_file()
+
+    def _describe_source(self) -> str:
+        path = self.current_data_path()
+        if self.source_switch.get() == "С компьютера" and self.local_path is not None:
+            return f"С компьютера: {path}"
+        return f"По ссылке: {path.name}"
+
+    def _on_source_change(self, value: str) -> None:
+        # На «С компьютера» сразу просим файл, если его ещё не выбирали.
+        if value == "С компьютера" and self.local_path is None:
+            self.choose_local_file()
+            return
+        self.reload_data(announce=False)
+
+    def choose_local_file(self) -> None:
+        """Диалог выбора xlsx на этом компьютере. Отмена не сбрасывает уже выбранный файл."""
+        selected = filedialog.askopenfilename(
+            title="Выберите файл Excel для расчёта",
+            parent=self,
+            initialdir=str((self.local_path or data_file()).parent),
+            filetypes=[("Книга Excel", "*.xlsx"), ("Все файлы", "*.*")],
+        )
+        if not selected:
+            if self.local_path is None:
+                self.source_switch.set("По ссылке")
+            return
+        self.local_path = Path(selected)
+        self.source_switch.set("С компьютера")
+        self.reload_data(announce=False)
+
     def reload_data(self, announce: bool = True) -> None:
+        """Перечитываем выбранный Excel, не закрывая окно."""
         previous_service = self.service_var.get()
         previous_extras = {row.key: (row.checked.get(), row.quantity.get()) for row in self.extra_rows}
+        source = self.current_data_path()
         try:
-            catalog = load_catalog()
+            catalog = load_catalog(source)
         except DataError as exc:
             self.catalog = None
+            self.file_caption.set(self._describe_source())
             self.status_var.set("Данные не загружены")
             messagebox.showerror("Ошибка данных", str(exc), parent=self)
             return
         except Exception as exc:
             self.catalog = None
+            self.file_caption.set(self._describe_source())
             self.status_var.set("Данные не загружены")
-            messagebox.showerror("Ошибка данных", _friendly_io_error(exc).args[0], parent=self)
+            messagebox.showerror("Ошибка данных", _friendly_io_error(exc, source).args[0], parent=self)
             return
 
         self.catalog = catalog
@@ -865,12 +973,13 @@ class CalculatorApp(ctk.CTk):
         self._hide_results()
         extras_count = len(extra_services(catalog))
         loaded = catalog.loaded_at.strftime("%H:%M:%S")
+        self.file_caption.set(self._describe_source())
         self.status_var.set(
             f"Данные обновлены в {loaded}: {len(catalog.materials)} материалов, "
             f"{len(catalog.services)} типов услуг, {extras_count} доп. услуг."
         )
         if announce:
-            messagebox.showinfo("Данные обновлены", "Файл calculator_data.xlsx прочитан заново.", parent=self)
+            messagebox.showinfo("Данные обновлены", f"Файл {source.name} прочитан заново.", parent=self)
 
     def _rebuild_extras(self, previous: dict[str, tuple[bool, str]]) -> None:
         for child in list(self.extras.winfo_children()):
@@ -882,7 +991,7 @@ class CalculatorApp(ctk.CTk):
         if not services:
             ctk.CTkLabel(
                 self.extras,
-                text="В листе «Лист3» нет дополнительных услуг.",
+                text="В листе констант нет дополнительных услуг.",
                 text_color=MUTED,
                 font=self._font(13),
                 wraplength=420,
@@ -947,6 +1056,7 @@ class CalculatorApp(ctk.CTk):
         self.placeholder.grid()
 
     def _quantities(self) -> dict[str, float]:
+        """В формулу попадают только отмеченные допы. Снятая галочка ничего не добавляет."""
         chosen: dict[str, float] = {}
         for row in self.extra_rows:
             if not row.checked.get():
@@ -959,6 +1069,7 @@ class CalculatorApp(ctk.CTk):
         return chosen
 
     def calculate(self) -> None:
+        """Берём площадь, услугу, локацию и галочки и показываем четыре суммы."""
         if self.catalog is None:
             messagebox.showwarning("Нет данных", "Сначала загрузите calculator_data.xlsx.", parent=self)
             return
@@ -1002,10 +1113,11 @@ class CalculatorApp(ctk.CTk):
         )
         self.placeholder.grid_remove()
         self.results_box.grid()
-        self.status_var.set("Расчёт выполнен по текущему файлу calculator_data.xlsx.")
+        self.status_var.set(f"Расчёт выполнен по файлу {self.current_data_path().name}.")
 
 
 def main() -> None:
+    """Отдельный идентификатор нужен, чтобы Windows показала нашу иконку на панели задач."""
     if sys.platform.startswith("win"):
         try:
             ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("local.cleaning.calculator")
